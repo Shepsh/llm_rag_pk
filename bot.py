@@ -140,8 +140,15 @@ def summarize_over_originals(
         {"type": "text",
          "text": header + "\n\nЗапрос пользователя: " + user_query + "\n\nКонтекст:\n" + text_context}
     ]
+    from langfuse.langchain import CallbackHandler
 
-    chat = ChatOpenAI(model=model_name, temperature=0, max_tokens=max_tokens)
+    langfuse_handler = CallbackHandler()
+    chat = ChatOpenAI(
+            model=model_name,
+            temperature=0,
+            max_tokens=max_tokens,
+            callbacks = [langfuse_handler]
+                        )
     msg = chat.invoke([HumanMessage(content=parts)])
     answer = msg.content
 
@@ -187,15 +194,36 @@ load_dotenv()
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Welcome to the RAG system! Ask me anything.")
 
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_message = update.message.text
+    user_id = update.message.from_user.id if update.message.from_user else None
+
+    langfuse = context.application.langfuse  # если в main() сохранили в app
+
     try:
-        response = query_rag_system(user_message)
-        for part in chunk_text(response):
-            await update.message.reply_text(part)
+        with langfuse.start_as_current_observation(
+            as_type="span",
+            name="telegram-rag-query",
+            trace_context={"user_id": user_id, "input": {"user_message": user_message}}
+        ) as span:
+            response = query_rag_system(user_message)
+
+            span.update_trace(output={"answer": response, "status": "SUCCESS"})
+            span.end()
+
+            for part in chunk_text(response):
+                await update.message.reply_text(part)
     except Exception as e:
         logger.exception("Error handling message")
+        with langfuse.start_as_current_observation(
+            as_type="span",
+            name="telegram-rag-query-error",
+            trace_context={"user_id": user_id, "input": {"user_message": user_message}}
+        ) as span:
+            span.end(output={"error": str(e), "status": "ERROR"})
         await update.message.reply_text("Sorry, something went wrong.")
+
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Update %s caused error %s", update, context.error)
@@ -219,16 +247,9 @@ def main() -> None:
 
         if not (persist_dir and docstore_path and meta_path):
             raise ValueError("Set RAG_PERSIST_DIR, RAG_DOCSTORE_PATH, RAG_META_PATH in env/.env")
-        LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY")
-        LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY")
-        LANGFUSE_BASE_URL = os.getenv("LANGFUSE_BASE_URL")
-        from langfuse import Langfuse
+        from langfuse import get_client
 
-        langfuse = Langfuse(
-            public_key=LANGFUSE_PUBLIC_KEY,
-            secret_key=LANGFUSE_SECRET_KEY,
-            base_url=LANGFUSE_BASE_URL
-        )
+        langfuse = get_client()
 
         # Проверка подключения
         if langfuse.auth_check():
@@ -252,7 +273,7 @@ def main() -> None:
         )
 
 
-
+        app.langfuse = langfuse
         app.add_handler(CommandHandler("start", start))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         app.add_error_handler(error_handler)
